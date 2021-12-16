@@ -1,0 +1,563 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+Summary of experiment:
+Used A673 and CHLA10 cells and performed CITE-seq using Cell hashing with two HTOs. (A673-HTO1, CHLA10-HTO2)
+performed the analysis in Seurat and also used Monocle3 for plots. 
+
+#Packages needed for the analysis
+```{r}
+library(patchwork)
+library(Seurat)
+library(cowplot)
+library(ggplot2)
+library(multtest)
+library(dplyr)
+library(umap)
+library(RBGL)
+library(Vennerable)
+library(tibble)
+library(pheatmap)
+library(monocle3)
+library(m3addon)
+library(devtools)
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(sf)
+library(tidyverse)
+```
+
+## DATA IMPORT
+genematrix contains barcode data, feature data (genes), and the matrix that 
+combines the barcodes (cells) and feature data in a 2D matrix.
+the HTO matrix contains the barcode data (cells) with the HT data (HTO1-A673, HTO2-CHLA10)
+
+# Set data file locations
+```{r}
+gex_matrix <- "/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/filtered_feature_bc_matrix"
+list.files(gex_matrix)
+
+hto_matrix <- "/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/HTO_matrix/umi_count"
+list.files(hto_matrix)
+
+```
+
+# Load in the data and remove unmapped reads
+```{r}
+# Load in UMIs
+ews.umis <- Read10X(gex_matrix)
+colnames(ews.umis)<-gsub("-1", "", colnames(ews.umis))
+#ews.umis
+
+# Load in HTOs
+ews.htos <- Read10X(hto_matrix, gene.column=1)
+#ews.htos
+#rownames(ews.htos)
+
+# Remove unmapped reads
+ews.htos <- ews.htos[setdiff(rownames(x = ews.htos), "unmapped"), ]
+#ews.htos
+#rownames(ews.htos)
+
+#for markdown output
+rownames(ews.htos)<-strsplit(rownames(ews.htos), "-") %>% sapply("[[", 1)
+```
+
+## Select cell barcodes detected by both RNA and HTO
+```{r}
+joint.bcs <- intersect(colnames(ews.umis), colnames(ews.htos))
+```
+# Subset RNA and HTO counts by joint cell barcodes
+```{r}
+ews.umis <- ews.umis[, joint.bcs]
+ews.htos <- as.matrix(ews.htos[, gsub("-1", "", joint.bcs)])
+```
+# Confirm that the HTO have the correct names
+```{r}
+rownames(ews.htos)
+```
+
+# ***************************************************************
+
+## INITIALIZE SEURAT OBJECT
+```{r}
+# Setup Seurat object
+ews.hashtag <- CreateSeuratObject(counts = ews.umis)
+```
+
+```{r}
+# Normalize RNA data with log normalization
+ews.hashtag <- NormalizeData(ews.hashtag)
+```
+
+```{r}
+# Find and scale variable features")
+ews.hashtag <- ScaleData(ews.hashtag, features = VariableFeatures(ews.hashtag))
+```
+
+```{r}
+# Add HTO data as a new assay independent from RNA
+ews.hashtag[["HTO"]] <- CreateAssayObject(counts = ews.htos)
+```
+
+# ***************************************************************
+## PROCESS SEURAT OBJECT
+
+```{r}
+# Normalize HTO data, here we use centered log-ratio (CLR) transformation
+ews.hashtag <- NormalizeData(ews.hashtag, assay = "HTO", normalization.method = "CLR")
+log10(ews.hashtag@assays$HTO@counts)[1,]==ews.hashtag@assays$HTO@data[1,]
+```
+
+#determine HTO reads
+```{r}
+# If you have a very large dataset we suggest using k_function = 'clara'. This is a k-medoid clustering function for large applications You can also play with additional parameters (see documentation for HTODemux()) to adjust the threshold for classification Here we are using the default settings.
+ews.hashtag <- HTODemux(ews.hashtag, assay = "HTO", positive.quantile = 0.99) # Set between 0.75 to 0.99 to change stringency 
+ews.hashtag
+```
+
+#determine HTO classification(doublet, singlet, negative for either HTO 1 or 2)
+```{r}
+# Global classification results
+ews.hashtag <- FindVariableFeatures(ews.hashtag, selection.method = "vst", verbose = FALSE)
+table(ews.hashtag$HTO_classification.global)
+```
+
+##graphics for the HTO classifications
+
+#ridgeplot of HTO expression
+```{r fig.height=7, fig.width=15}
+# Group cells based on the max HTO signal
+Idents(ews.hashtag) <- "HTO_maxID"
+RidgePlot(ews.hashtag, assay = "HTO", features = rownames(ews.hashtag[["HTO"]])[1:2], ncol = 1)
+```
+
+#scatter plot of HTO expression
+```{r fig.height=4, fig.width=8}
+# Visualize pairs of HTO signals to confirm mutual exclusivity in singlets
+FeatureScatter(ews.hashtag, feature1 = "HTO1", feature2 = "HTO2")
+```
+
+#heatmap of HTO expression
+```{r}
+# View HTO heatmap (to increase plotting efficiency, use num.cells argument)
+HTOHeatmap(ews.hashtag, assay = "HTO", ncells = 5000)
+```
+
+#violin plot comparing the nfeature, ncount, and percent mt for singlet, doublet, negative cells
+```{r}
+# Compare number of UMIs for singlets, doublets and negative cells
+Idents(ews.hashtag) <- "HTO_classification.global"
+ews.hashtag[["percent.mt"]] <- PercentageFeatureSet(ews.hashtag, pattern = "^MT-")
+VlnPlot(ews.hashtag, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0.1, ncol = 3)
+```
+
+#Feature scatter plot comparing features from above
+```{r}
+plot1 <- FeatureScatter(ews.hashtag, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(ews.hashtag, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+CombinePlots(plots = list(plot1, plot2))
+```
+
+#filter the cells based on the quality metrics identified above
+```{r}
+# Use the violin plots to pick cutoffs
+ews.hashtag
+ews.hashtag <- subset(ews.hashtag, subset = nFeature_RNA > 500 & nFeature_RNA < 7000 & nCount_RNA > 100 & nCount_RNA < 60000 & percent.mt < 15) # Adjust these as needed per case
+ews.hashtag
+```
+
+#####Data analysis in Seurat 
+
+# Extract the singlets (one HTO barcode read for one cell)
+```{r}
+ews.singlet <- subset(ews.hashtag, idents = "Singlet")
+ews.singlet
+```
+#Find the variable features
+```{r}
+# Select the variable features
+ews.singlet <- FindVariableFeatures(ews.singlet, selection.method = "vst")
+```
+#scale the data
+```{r}
+# Scaling RNA data (only scale the variable features here for efficiency)
+ews.singlet <- ScaleData(ews.singlet, features = VariableFeatures(ews.singlet))
+```
+#PCA plots
+```{r}
+# Run PCA
+ews.singlet <- RunPCA(ews.singlet, features = VariableFeatures(ews.singlet))
+ElbowPlot(ews.singlet)
+DimPlot(ews.singlet, group.by = "HTO_classification")
+DimPlot(ews.singlet, split.by = "HTO_classification", ncol = 2)
+```
+#UMAP and cluster analysis
+```{r}
+# Choose PCs for clustering and umap based on PCElbowPlot
+ews.singlet <- FindNeighbors(ews.singlet, reduction = "pca", dims = 1:14) # Set # of dims based on desired # of PCAs
+ews.singlet <- FindClusters(ews.singlet, resolution = 0.8) # Adjust resolution to force more or fewer clusters
+ews.singlet <- RunUMAP(ews.singlet, reduction = "pca", dims = 1:14) # Set # of dims based on desired # of PCAs
+
+DimPlot(ews.singlet, group.by = "HTO_classification")
+DimPlot(ews.singlet, split.by = "HTO_classification", ncol = 2)
+```
+#UMAP by gene expressions
+```{r}
+DimPlot(ews.singlet, reduction = 'umap', pt.size = 0.5)+scale_color_manual(values=pals::glasbey())
+ews.singlet$celltype<-"CHLA-10"
+ews.singlet$celltype[ews.singlet@reductions$umap@cell.embeddings[,1]<0]<-"A673"
+DimPlot(ews.singlet, reduction = 'umap', group.by = "celltype", pt.size = 0.5)+scale_color_manual(values=pals::glasbey())
+
+```
+
+#cell cycle analysis
+```{r}
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+ews.singlet <- CellCycleScoring(ews.singlet, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+RidgePlot(ews.singlet, features = c("PCNA", "TOP2A", "MCM6", "MKI67"), ncol = 2)
+ews.singlet<- RunPCA(ews.singlet, features = c(s.genes, g2m.genes))
+DimPlot(ews.singlet)
+```
+
+#add module scores to Seurat object 
+```{r}
+mes<- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/mesenchyme_dev.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = mes, name = "mes")
+
+IC_EWS_78 <-read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/ICEWS_genes_78.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = IC_EWS_78, name = "IC_EWS_78")
+
+kinsey_activated<- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/kinsey_EF_activated.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = kinsey_activated, name = "kinsey_activated")
+
+kinsey_repressed<- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/kinsey_EF_repressed.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = kinsey_repressed, name = "kinsey_repressed")
+
+HOX_activated <- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/HOXD13_activated.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = HOX_activated, name = "HOXD13.activated")
+
+HOX_repressed <- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/HOXD13_repressed.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = HOX_repressed, name = "HOXD13.repressed")
+
+```
+
+#save object
+```{r}
+saveRDS(ews.singlet, "110121_EWS_singlet.rds")
+```
+
+
+#splitting object by cell line
+```{r}
+ews.singlet.A <- subset(ews.singlet, celltype== "A673")
+ews.singlet.C <- subset(ews.singlet, celltype== "CHLA-10")
+```
+
+
+# ***************************************************************
+##### Export Seurat Object to Monocle 3
+```{r}
+###plot in monocle object
+pdw<-DataFrame(ews.singlet@meta.data)
+fdd<-ews.singlet@assays$RNA@meta.features
+fdd$gene_short_name<-rownames(fdd)
+fdd$id<-rownames(fdd)
+cds<-new_cell_data_set(expression_data = ews.singlet@assays$RNA@counts, cell_metadata = cbind(pdw, as.matrix(t(ews.singlet@assays$HTO@counts))), gene_metadata = fdd)
+
+#detect genes and calculate the dispersion
+cds<-detect_genes(cds)
+cds<-calculate_gene_dispersion(cds)
+plot_gene_dispersion(cds)
+cds<-select_genes(cds, top_n = 4000)
+plot_gene_dispersion(cds)
+
+#preprocess
+cds<-preprocess_cds(cds, use_genes = get_selected_genes(cds))
+plot_pc_variance_explained(cds)
+
+#plot cells by seurat clusters
+cds<-reduce_dimension(cds, num_dim = 25, verbose = T)
+
+plot_cells(cds, color_cells_by = "seurat_clusters", cell_size=0.7, label_cell_groups = F)+scale_color_manual(values=pals::glasbey())
+
+saveRDS(cds, "110121_cds.rds")
+```
+
+
+#Figure 7 data
+#Uses both the Seurat and Monocle 3 .cds objects for plots
+```{r}
+#Plot cells by celltype
+plot_cells(cds, color_cells_by = "celltype", cell_size=0.7, label_cell_groups = F)+scale_color_manual(values =c( "darkred",  "blue"))
+
+#Plot cells by Seurat clustering
+plot_cells(cds, color_cells_by = "seurat_clusters", cell_size=0.7, label_cell_groups = F)+scale_color_manual(values=pals::glasbey())
+
+```
+
+
+#Scatter plot correlations
+```{r}
+#HOXD13 expression vs specific EWS-FLI1 activity
+FeatureScatter(ews.singlet, feature1 = "HOXD13", feature2 = "IC_EWS_781", group.by = "celltype")
+
+#HOXD13 activated vs EWS-FLI1 activated
+FeatureScatter(ews.singlet, feature1 = "HOXD13.activated1", feature2 = "kinsey_activated1", group.by = "celltype")
+
+#HOXD13 activated vs EWS-FLI1 repressed
+FeatureScatter(ews.singlet, feature1 = "HOXD13.activated1", feature2 = "kinsey_repressed1", group.by = "celltype")
+
+#HOXD13 activated vs mesenchyme development
+FeatureScatter(ews.singlet, feature1 = "HOXD13.activated1", feature2 = "mes1", group.by = "celltype")
+
+#EWS-FLI1 repressed vs mesenchyme development
+FeatureScatter(ews.singlet, feature1 = "kinsey_repressed1", feature2 = "mes1", group.by = "celltype")
+
+######violin plots
+
+#HOXD13 levels and EWS-FLI1 activity
+VlnPlot(ews.singlet, features = "HOXD13", group.by = "celltype", pt.size = 0.2)
+
+VlnPlot(ews.singlet, features = "IC_EWS_781", group.by = "celltype", pt.size = 0.2)
+
+VlnPlot(ews.singlet, features = c("HOXD13", "IC_EWS_781"), group.by = "celltype", pt.size = 0.2, ncol=3)
+
+
+######feature plots
+
+#HOXD13 expression
+monocle3::plot_cells(cds, gene="HOXD13", label_cell_groups = F, cell_size = 0.6, show_trajectory_graph = FALSE)+scale_color_gradientn(colors=c("cyan", "deepskyblue", "blue", "darkblue"), na.value = "lightgray")
+
+#IC-78_EWS
+IC_EWS_78_names<- IC_EWS_78$Gene
+plot_geneset(cds,marker_set = IC_EWS_78_names,name = "IC_EWS_genes_78")+scale_color_gradientn(colors=c("cyan", "cyan2", "deepskyblue", "blue", "darkblue"))
+
+HOXD_EF_genesets <-read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/HOXD_EF_genesets.txt",sep = "\t", header = TRUE)
+
+#HOXD13 activated and repressed
+HOXD13_activated<- HOXD_EF_genesets$HOXD13_activated
+HOXD13_repressed<- HOXD_EF_genesets$HOXD13_repressed
+plot_geneset(cds,marker_set = HOXD13_activated,name = "HOXD13_activated")+scale_color_gradientn(colors=c("cyan", "cyan2", "deepskyblue", "blue", "darkblue"))
+plot_geneset(cds,marker_set = HOXD13_repressed,name = "HOXD13_repressed")+scale_color_gradientn(colors=c("cyan", "cyan2", "deepskyblue", "blue", "darkblue"))
+
+#kinsey activated and repressed
+EWSFLI1_activated<- HOXD_EF_genesets$kinsey_EF_activated
+EWSFLI1_repressed<- HOXD_EF_genesets$kinsey_EF_repressed
+plot_geneset(cds,marker_set = EWSFLI1_activated,name = "EWS-FLI1_activated")+scale_color_gradientn(colors=c("cyan", "cyan2", "deepskyblue", "blue", "darkblue"))
+plot_geneset(cds,marker_set = EWSFLI1_repressed,name = "EWS-FLI1_repressed")+scale_color_gradientn(colors=c("cyan", "cyan2", "deepskyblue", "blue", "darkblue"))
+```
+
+scatter plots with gene sets as color
+```{r}
+MD<-ews.singlet@meta.data 
+ggplot(MD, aes(x =HOXD13.activated1,kinsey_repressed1, color= mes1)) +geom_point()+ scale_color_viridis_c(option = "turbo")
+```
+
+
+#####PDX data
+##to make the table of all of the PDX files
+```{r}
+## make sure that the working directory only contains the files that you want to load in 
+path.to.counts = "/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study */Data analysis/Data analysis Hg38- NEW/CITE-seq_new/PDX_counts"
+setwd(path.to.counts)
+files = list.files(path.to.counts)
+pdx.list = lapply(files, function(x) read.table(file=x, header = TRUE))
+
+pdx.names = c("PDX_1058", "PDX_184", "PDX_352", "PDX_856", "PDX_861")
+names(pdx.list) = pdx.names
+```
+```{r}
+
+for (name in pdx.names){
+  colnames(pdx.list[[name]]) = paste(colnames(pdx.list[[name]]), name, sep = "_")
+  colnames(pdx.list[[name]])[1] = "GENE"
+}
+
+colnames(pdx.list[[4]])
+
+```
+
+```{r}
+require(tidyverse)
+pdx.table = pdx.list %>% purrr::reduce(inner_join, by = "GENE")
+pdx.table = distinct(pdx.table)
+
+gene.info = pdx.table %>% group_by(GENE) %>% tally()
+dup.genes = gene.info %>% filter(n != 1)
+dup.genes ## 7 genes are duplicated for some reason and they have different count values 
+
+## appended unique ID to each gene to make into rownames
+pdx.table$gene.idx = rownames(pdx.table)
+pdx.table$gene.idx = paste(pdx.table$GENE, pdx.table$gene.idx, sep = "_")
+rownames(pdx.table) = pdx.table$gene.idx
+
+## remove gene name and index from data table 
+pdx.table = pdx.table %>% select(-GENE, -gene.idx)
+```
+
+##Make data into a monocle cds object
+```{r}
+load("/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/combined_pdx_table.Robj")
+dim(pdx.table)
+colnames(pdx.table)
+rownames(pdx.table)
+
+pdx.table<- tibble::rownames_to_column(pdx.table, "gene")
+pdx.table$gene <-gsub("_[0-9]+","", pdx.table$gene) 
+rownames(pdx.table) <- make.names(pdx.table[,1], unique = TRUE)
+pdx.table<- pdx.table[,-1]
+mat_pdx <- as.matrix(pdx.table)
+
+#create metadata
+metadf_pdx <- DataFrame(id=as.character(colnames(mat_pdx)), row.names = colnames(mat_pdx))
+gmeta_pdx <- DataFrame(id=rownames(mat_pdx), gene_short_name=rownames(mat_pdx), row.names = rownames(mat_pdx))
+
+#make new CDS
+cds_pdx <-new_cell_data_set(mat_pdx, cell_metadata = metadf_pdx, gene_metadata = gmeta_pdx)
+
+cds_pdx <- detect_genes(cds_pdx)
+cds_pdx<-calculate_gene_dispersion(cds_pdx)
+plot_gene_dispersion(cds_pdx)
+cds_pdx<-select_genes(cds_pdx, top_n = 4000)
+plot_gene_dispersion(cds_pdx)
+#cds_pdx<-select_genes(cds_pdx, fit_min = 1.05)
+#plot_gene_dispersion(cds_pdx)
+
+#preprocess
+cds_pdx <-preprocess_cds(cds_pdx, use_genes = get_selected_genes(cds_pdx))
+plot_pc_variance_explained(cds_pdx)
+
+#Reduce dimensions and look at clusters
+cds_pdx<-reduce_dimension(cds_pdx, verbose = T, num_dim = 30, umap.min_dist = 0.5)
+
+cds_pdx <- cluster_cells(cds_pdx, method= "UMAP")
+
+```
+
+#Load in .rds and look at the clusters
+```{r}
+plot_cells(cds_pdx, color_cells_by = "cluster", cell_size = 0.6, label_cell_groups = F)
+
+head(cds_pdx@metadata)
+head(cds_pdx@colData)
+#copy the id into a new column called cell_line
+cds_pdx@colData$cell_line <- cds_pdx@colData$id
+
+#remove the barcode
+cds_pdx@colData$cell_line <- gsub("^.{0,17}", "", cds_pdx@colData$cell_line)
+cds_pdx@colData$cell_line <- gsub("1_", "", cds_pdx@colData$cell_line)
+
+saveRDS(cds_pdx, "101321_pdx_ews.rds")
+
+```
+
+#make the PDX table from monocle to a seurat object
+```{r}
+count.mat <- assay(cds_pdx)
+meta.df <- as.data.frame(colData(cds_pdx))
+
+my.seurat <- CreateSeuratObject(counts = count.mat,
+project = "my.project",
+assay = "RNA",
+meta.data = meta.df)
+
+my.seurat <- NormalizeData(my.seurat)
+# Find and scale variable featuresot")
+my.seurat <- ScaleData(my.seurat, features = VariableFeatures(my.seurat))
+my.seurat[["percent.mt"]] <- PercentageFeatureSet(my.seurat, pattern = "^MT-")
+VlnPlot(my.seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), pt.size = 0.1, ncol = 3)
+my.seurat <- subset(my.seurat, subset = nFeature_RNA > 500 & nFeature_RNA < 6000 & nCount_RNA > 100 & nCount_RNA < 50000)
+
+my.seurat <- FindVariableFeatures(my.seurat, selection.method = "vst")
+my.seurat <- ScaleData(my.seurat, features = VariableFeatures(my.seurat))
+my.seurat <- RunPCA(my.seurat, features = VariableFeatures(my.seurat))
+
+my.seurat  <- FindNeighbors(my.seurat , reduction = "pca", dims = 1:14) # Set # of dims based on desired # of PCAs
+my.seurat  <- FindClusters(my.seurat , resolution = 0.8) # Adjust resolution to force more or fewer clusters
+my.seurat  <- RunUMAP(my.seurat , reduction = "pca", dims = 1:14)
+
+DimPlot(my.seurat, reduction = 'umap', pt.size = 0.5)+scale_color_manual(values=pals::glasbey())
+
+DimPlot(my.seurat, reduction = 'umap', group.by = "cell_line", pt.size = 0.5)+scale_color_manual(values=pals::glasbey())
+
+IC_EWS_78 <-read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/ICEWS_genes_78.txt",sep = "\t", header = TRUE)
+my.seurat<- AddModuleScore(my.seurat, features = IC_EWS_78, name = "IC_EWS_78")
+
+kinsey_activated<- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/HOX_Paper_analysis/genesets/kinsey_activated.txt",sep = "\t", header = TRUE)
+my.seurat<- AddModuleScore(my.seurat, features = kinsey_activated, name = "kinsey_activated")
+
+kinsey_repressed<- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/HOX_Paper_analysis/genesets/kinsey_repressed.txt",sep = "\t", header = TRUE)
+my.seurat<- AddModuleScore(my.seurat, features = kinsey_repressed, name = "kinsey_repressed")
+
+HOX_activated <- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/HOX_Paper_analysis/genesets/overlap_dn_shHOXD13.txt",sep = "\t", header = TRUE)
+my.seurat<- AddModuleScore(my.seurat, features = HOX_activated, name = "HOXD13.activated")
+
+HOX_repressed <- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Sequencing/Single-cell/CITE-seq /121119 A673 and CHLA10 Pilot study/Data analysis/Data analysis Hg38- NEW/CITE-seq_new/HOX_Paper_analysis/genesets/overlap_up_shHOXD13.txt",sep = "\t", header = TRUE)
+my.seurat<- AddModuleScore(my.seurat, features = HOX_repressed, name = "HOXD13.repressed")
+
+mes<- read.delim("/Volumes/Aprils/Lawlor Lab/HOX project /Paper outlines/Paper 1-HOX /Cell Reports/GEO/text files for GIThub/mesenchyme_dev.txt",sep = "\t", header = TRUE)
+ews.singlet<- AddModuleScore(ews.singlet, features = mes, name = "mes")
+my.seurat<- AddModuleScore(my.seurat, features = mes, name = "mes")
+
+saveRDS(my.seurat, "101321_pdx_ews_seurat.rds")
+
+```
+
+#Figure 7 data
+#Uses both the Seurat and Monocle 3 .cds objects for plots
+```{r}
+#Plot cells by celltype
+plot_cells(cds_pdx, color_cells_by = "cell_line", cell_size = 0.8, label_cell_groups = F)
+
+```
+
+#Scatter plot correlations
+```{r}
+#HOXD13 expression vs specific EWS-FLI1 activity
+FeatureScatter(my.seurat, feature1 = "HOXD13", feature2 = "IC_EWS_781", group.by = "cell_line")
+
+#HOXD13 activated vs EWS-FLI1 activated
+FeatureScatter(my.seurat, feature1 = "HOXD13.activated1", feature2 = "kinsey_activated1", group.by = "cell_line")
+
+#HOXD13 activated vs EWS-FLI1 repressed
+FeatureScatter(my.seurat, feature1 = "HOXD13.activated1", feature2 = "kinsey_repressed1", group.by = "cell_line")
+
+#HOXD13 activated vs mesenchyme development
+FeatureScatter(my.seurat, feature1 = "HOXD13.activated1", feature2 = "mes1", group.by = "cell_line")
+
+#EWS-FLI1 repressed vs mesenchyme development
+FeatureScatter(my.seurat, feature1 = "kinsey_repressed1", feature2 = "mes1", group.by = "cell_line")
+
+######violin plots
+
+#HOXD13 levels and EWS-FLI1 activity
+VlnPlot(my.seurat, features = "HOXD13", group.by = "cell_line", pt.size = 0.2)
+
+VlnPlot(my.seurat, features = "IC_EWS_781", group.by = "cell_line", pt.size = 0.2)
+
+VlnPlot(my.seurat, features = c("HOXD13", "IC_EWS_781"), group.by = "cell_line", pt.size = 0.2, ncol=3)
+
+
+######feature plots
+
+#HOXD13 expression
+monocle3::plot_cells(cds_pdx, gene="HOXD13", label_cell_groups = F, cell_size = 0.6, show_trajectory_graph = FALSE)+scale_color_gradientn(colors=c("cyan", "deepskyblue", "blue", "darkblue"), na.value = "lightgray")
+
+#IC-78_EWS
+IC_EWS_78_names<- IC_EWS_78$Gene
+plot_geneset(cds_pdx,marker_set = IC_EWS_78_names,name = "IC_EWS_genes_78")+scale_color_gradientn(colors=c("cyan", "cyan2", "deepskyblue", "blue", "darkblue"))
+
+```
+
+scatter plots with gene sets as color
+```{r}
+MD_pdx<-my.seurat@meta.data 
+ggplot(MD_pdx, aes(x =HOXD13.activated1,kinsey_repressed1, color= mes1)) +geom_point()+ scale_color_viridis_c(option = "turbo")
+```
+
